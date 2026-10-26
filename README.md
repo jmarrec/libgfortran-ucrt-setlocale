@@ -1,4 +1,4 @@
-# libgfortran: use-after-free of the saved `LC_NUMERIC` name on UCRT
+# libgfortran: formatted I/O restores `LC_NUMERIC` through an invalidated pointer (MinGW-w64)
 
 [![mcve](https://github.com/jmarrec/libgfortran-ucrt-setlocale/actions/workflows/mcve.yml/badge.svg)](https://github.com/jmarrec/libgfortran-ucrt-setlocale/actions/workflows/mcve.yml)
 (failing = bug reproduced)
@@ -17,31 +17,41 @@ setlocale (LC_NUMERIC, old_locale);          // restores through that pointer
 ```
 
 C11 7.11.1.1p8 allows the string returned by `setlocale(cat, NULL)` to be
-overwritten by a later `setlocale` call. UCRT frees it when the category
-changes, so the restore reads freed memory. msvcrt (and glibc for `"C"`) happen
-to keep the string alive, which is why this went unnoticed.
+overwritten by a later `setlocale` call. Both Windows C runtimes invalidate it,
+in different ways:
+
+- **msvcrt** returns a static buffer that `setlocale(LC_NUMERIC, "C")`
+  overwrites with `"C"`. So libgfortran always "restores" `"C"`: a program that
+  set a non-C `LC_NUMERIC` is silently reset to `"C"` by its first formatted I/O
+  statement. This is deterministic. It goes unnoticed because most programs
+  never call `setlocale`, so the locale is `"C"` anyway.
+- **UCRT** returns a heap buffer and frees it on the next `setlocale` call
+  (even a query: consecutive `setlocale(LC_NUMERIC, NULL)` calls alternate
+  between two buffers). So the restore reads freed memory on every formatted
+  I/O statement.
 
 ## Consequences with MinGW-w64 UCRT builds of gfortran
 
-- Every formatted I/O statement restores `LC_NUMERIC` through a freed string.
-  What happens next depends on what the freed memory holds:
-  - The garbage may resolve to the user's locale (here `English_United States.1252`).
-    The process `LC_NUMERIC` then stays wrong for any C code in the same process,
-    and every later statement performs two real locale switches (user → C → user).
+- What a restore through freed memory does depends on what the memory holds:
+  - The garbage may resolve to the user's locale (here `English_United States.1252`),
+    even when the program never called `setlocale`. The process `LC_NUMERIC` then
+    stays wrong for any C code in the same process, and every later statement
+    performs two real locale switches (user → C → user).
   - Or the restore fails (`NULL`) and the locale stays `"C"`. This was seen on
     GitHub's `windows-latest` runners.
-- Either way UCRT's `setlocale` is much more expensive than msvcrt's. Measured
-  per internal write with GCC 16.2.0: 2.5 µs (msvcrt) vs 6.8 µs (UCRT, user-locale
-  case) locally, and 1.0 µs vs 2.5 µs (UCRT, failed-restore case) on GitHub runners.
-  An I/O-heavy program (EnergyPlus `ReadVarsESO`) runs about 3x slower.
-- With the debug CRT the restore fails instead (`NULL`). With ASan it is
-  reported as `heap-use-after-free`, freed in `ucrt\src\appcrt\locale\setlocale.cpp`.
+  - Or the freed memory still holds the old name, and the restore works by luck.
+- UCRT's `setlocale` is also much more expensive than msvcrt's. Measured per
+  internal write with GCC 16.2.0: 2.5 µs (msvcrt) vs 6.8 µs (UCRT, user-locale
+  case) locally, and 1.0 µs vs 2.5 µs (UCRT, failed-restore case) on GitHub
+  runners. An I/O-heavy program (EnergyPlus `ReadVarsESO`) runs about 3x slower.
+- With the debug CRT the restore fails (`NULL`). With ASan it is reported as
+  `heap-use-after-free`, freed in `ucrt\src\appcrt\locale\setlocale.cpp`.
 
 ## Files
 
 | File | What it shows | Exit code |
 |---|---|---|
-| `mcve.f90` | One `write(buf,'(I0)')` replaces the `LC_NUMERIC` name buffer libgfortran saved (and may change the process `LC_NUMERIC`); times internal writes | 1 = bug |
+| `mcve.f90` | (1) From the default `"C"` locale: whether one `write` changes `LC_NUMERIC`, and the cost per internal write. (2) From `LC_NUMERIC` = `French`: whether each of 1000 `write` statements leaves it unchanged | 1 = bug |
 | `mcve.c` | The exact save/switch/restore sequence, without Fortran | 1 = bug |
 | `.github/workflows/mcve.yml` | Runs both against niXman mingw-builds GCC 16.2.0 (`posix-seh-ucrt`, `posix-seh-msvcrt`) and the C MCVE against MSVC | failing job = bug reproduced |
 
@@ -62,33 +72,40 @@ cl /nologo /MTd mcve.c && mcve.exe                     :: deterministic: freed m
 cl /nologo /Zi /fsanitize=address mcve.c && mcve.exe   :: heap-use-after-free report
 ```
 
-Both MCVEs detect the bug without depending on the contents of freed memory.
-They check that the name buffer returned by `setlocale(LC_NUMERIC, NULL)` was
-replaced. UCRT apparently allocates the new buffer before freeing the old
-one, so the address changes, while msvcrt keeps a static buffer. In 20 repeated runs
-each, detection was 20/20 with MinGW-w64 UCRT and with MSVC `/MT`, and 0/20
-false positives with msvcrt. What the stale pointer reads and what the restore
-does still vary with heap state. `/MTd` (freed memory is `0xDD`) and ASan show
-that part deterministically.
+### How the checks avoid depending on luck
 
-Do not add a `setlocale(LC_NUMERIC, NULL)` call between saving the pointer and
-the restore. UCRT may then allocate at the just-freed address, which hides
-both symptoms.
+- `mcve.f90` part (2) calls a function in the output list
+  (`write(buf, '(I0,A)') i, clobber()`). gfortran evaluates it inside the
+  transfer, after libgfortran switched to `"C"` (freeing the saved name with
+  UCRT) and before it restores. `clobber()` allocates and fills small heap
+  blocks, so the freed name is reliably garbage by the time libgfortran
+  restores through it. Over 10 runs: stock UCRT restored correctly 0/1000 every
+  time, msvcrt 0/1000 (always `"C"`), patched libgfortran 1000/1000.
+- `mcve.c` compares the pointer returned by `setlocale(LC_NUMERIC, "C")` with
+  the saved one, which never reads freed memory. That was 20/20 with MinGW-w64
+  UCRT and MSVC `/MT`, and 0/20 with msvcrt. Do not add a
+  `setlocale(LC_NUMERIC, NULL)` query in between. UCRT then allocates at the
+  just-freed address, which hides the symptoms.
 
 On Compiler Explorer, use `x64 msvc v19.latest` with `/MTd`. ASan does not run
 there, because the ASan runtime DLL is missing (`0xC0000135`).
 
 ## Results
 
+### CI, first version of `mcve.f90`
+
 Observed on GitHub `windows-latest`, commit `c33d076`, 2026-10-26
 ([run 40340157299](https://github.com/jmarrec/libgfortran-ucrt-setlocale/actions/runs/40340157299);
-Actions logs expire after 90 days, so the key output is reproduced here).
+Actions logs expire after 90 days, so the key output is reproduced here). At
+that commit `mcve.f90` only had the default-locale check, plus a name-buffer
+address check. That address check was dropped later because the patched
+libgfortran's own query also moves the buffer under UCRT.
 
 | Toolchain | Program | Expected | Observed |
 |---|---|---|---|
 | MinGW-w64 GCC 16.2.0 posix-seh-**ucrt** | `mcve.f90` | BUG | BUG: name buffer replaced (`…ADE44` → `…B1334`), `LC_NUMERIC` stayed `"C"`, 2185 ns/stmt |
 | | `mcve.c` | BUG | BUG: buffer replaced, stale contents `"m\x02"`, restore returned `NULL` |
-| MinGW-w64 GCC 16.2.0 posix-seh-**msvcrt** | `mcve.f90` | OK | OK: same static buffer throughout, 925 ns/stmt |
+| MinGW-w64 GCC 16.2.0 posix-seh-**msvcrt** | `mcve.f90` | OK at that commit (the `French` check did not exist yet) | OK: same static buffer throughout, 925 ns/stmt |
 | | `mcve.c` | OK | OK |
 | MSVC `/O2 /MT` | `mcve.c` | BUG | BUG: buffer replaced. The stale contents still read `"C"` and the restore "worked", so only the address check catches it here |
 | MSVC `/MTd` | `mcve.c` | BUG | BUG: stale contents `0xDD` fill, restore returned `NULL` |
@@ -102,27 +119,54 @@ ERROR: AddressSanitizer: heap-use-after-free on address 0x12153e9a0194
 SUMMARY: AddressSanitizer: heap-use-after-free D:\a\libgfortran-ucrt-setlocale\libgfortran-ucrt-setlocale\mcve.c:29 in main
 ```
 
-Locally (Windows 10, user locale `English_United States.1252`), the UCRT restore
-instead lands on the user locale. The Fortran MCVE then reports
-`LC_NUMERIC after one I/O: English_United States.1252` at 6.8 µs/stmt, vs
-2.5 µs/stmt with msvcrt.
+### Locally, current `mcve.f90`, with and without the fix
 
-## Suggested fix
+Windows 10, user locale `English_United States.1252`, GCC 16.2.0. "Patched" is
+niXman's UCRT `libgfortran.a` with `io/transfer.o` and `io/unit.o` rebuilt from
+16.2.0 sources plus the fix below.
 
-Copy the name before switching, for example into a static buffer guarded by
-`old_locale_lock`:
+| Build | Default `"C"`: after one I/O | From `French`: restored correctly | ns per internal write | Exit |
+|---|---|---|---|---|
+| UCRT, stock | `English_United States.1252` | 0/1000 | 6845 | 1 (bug) |
+| UCRT, **patched** | `C` | 1000/1000 | **1795** | 0 |
+| msvcrt, stock | `C` | 0/1000 (reset to `"C"`) | 2931 | 1 (bug) |
 
-```c
-static char old_locale_buf[256];  // replaces the char *old_locale
-...
-if (!old_locale_ctr++)
-  {
-    strncpy (old_locale_buf, setlocale (LC_NUMERIC, NULL), sizeof old_locale_buf - 1);
-    setlocale (LC_NUMERIC, "C");
-  }
-...
-if (!--old_locale_ctr)
-  setlocale (LC_NUMERIC, old_locale_buf);
+EnergyPlus `ReadVarsESO` on an annual 5ZoneAirCooled ESO (11.5 MB), median of
+8 runs, identical CSV output:
+
+| Build | Median | vs 25.1 |
+|---|---|---|
+| GCC 16.2 UCRT + patched libgfortran | **2.98 s** | 0.86x |
+| EnergyPlus 25.1 shipped (GCC 8.1 msvcrt) | 3.47 s | 1.00x |
+| GCC 16.2 msvcrt, stock | 4.04 s | 1.17x |
+| GCC 16.2 UCRT, stock | 11.10 s | 3.20x |
+
+## Fix
+
+Copy the name, and skip the switch when `LC_NUMERIC` is already `"C"` (the
+common case), which saves two `setlocale` calls per data transfer statement:
+
+```diff
+       if (!old_locale_ctr++)
+ 	{
+-	  old_locale = setlocale (LC_NUMERIC, NULL);
+-	  setlocale (LC_NUMERIC, "C");
++	  /* The next setlocale call may free this string; keep a copy.  */
++	  const char *cur_locale = setlocale (LC_NUMERIC, NULL);
++	  if (cur_locale != NULL && strcmp (cur_locale, "C") != 0)
++	    {
++	      old_locale = strdup (cur_locale);
++	      setlocale (LC_NUMERIC, "C");
++	    }
+ 	}
+ ...
+-  if (!--old_locale_ctr)
++  if (!--old_locale_ctr && old_locale != NULL)
+     {
+       setlocale (LC_NUMERIC, old_locale);
++      free (old_locale);
+       old_locale = NULL;
+     }
 ```
 
 On Windows, `_configthreadlocale(_ENABLE_PER_THREAD_LOCALE)` together with

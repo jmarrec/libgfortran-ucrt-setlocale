@@ -5,8 +5,9 @@ on:
   pull_request:
   workflow_dispatch:
 
-# A failing job means the bug reproduced. The UCRT and MSVC debug/ASan jobs are
-# expected to fail until libgfortran stops reusing the setlocale(..., NULL) pointer.
+# A failing job means the bug reproduced. All jobs except the C MCVE on msvcrt are
+# expected to fail until libgfortran stops reusing the setlocale(..., NULL) pointer
+# (the Fortran MCVE fails on msvcrt too: a non-"C" LC_NUMERIC is reset to "C").
 
 jobs:
   mingw:
