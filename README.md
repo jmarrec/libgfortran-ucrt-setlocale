@@ -1,5 +1,8 @@
 # libgfortran: use-after-free of the saved `LC_NUMERIC` name on UCRT
 
+[![mcve](https://github.com/jmarrec/libgfortran-ucrt-setlocale/actions/workflows/mcve.yml/badge.svg)](https://github.com/jmarrec/libgfortran-ucrt-setlocale/actions/workflows/mcve.yml)
+(failing = bug reproduced)
+
 On targets without `uselocale` (MinGW-w64), libgfortran wraps every formatted
 I/O statement in a global locale switch (`libgfortran/io/transfer.c`,
 `#ifndef HAVE_POSIX_2008_LOCALE` branches, unchanged on trunk as of 2026-10):
@@ -75,16 +78,34 @@ both symptoms.
 On Compiler Explorer, use `x64 msvc v19.latest` with `/MTd`. ASan does not run
 there, because the ASan runtime DLL is missing (`0xC0000135`).
 
-## Expected results
+## Results
 
-| Toolchain | `mcve.f90` | `mcve.c` |
-|---|---|---|
-| MinGW-w64 GCC 16.2.0 posix-seh-**ucrt** | BUG (buffer replaced; `LC_NUMERIC` → user locale or stays `"C"`) | BUG |
-| MinGW-w64 GCC 16.2.0 posix-seh-**msvcrt** | OK | OK |
-| MSVC `/MT` | — | BUG |
-| MSVC `/MTd` | — | BUG (restore returns `NULL`) |
-| MSVC `/fsanitize=address` | — | heap-use-after-free |
-| Linux glibc | not affected (`uselocale` path) | OK (`"C"` is a static string) |
+Observed on GitHub `windows-latest`, commit `c33d076`, 2026-10-26
+([run 40340157299](https://github.com/jmarrec/libgfortran-ucrt-setlocale/actions/runs/40340157299);
+Actions logs expire after 90 days, so the key output is reproduced here).
+
+| Toolchain | Program | Expected | Observed |
+|---|---|---|---|
+| MinGW-w64 GCC 16.2.0 posix-seh-**ucrt** | `mcve.f90` | BUG | BUG: name buffer replaced (`…ADE44` → `…B1334`), `LC_NUMERIC` stayed `"C"`, 2185 ns/stmt |
+| | `mcve.c` | BUG | BUG: buffer replaced, stale contents `"m\x02"`, restore returned `NULL` |
+| MinGW-w64 GCC 16.2.0 posix-seh-**msvcrt** | `mcve.f90` | OK | OK: same static buffer throughout, 925 ns/stmt |
+| | `mcve.c` | OK | OK |
+| MSVC `/O2 /MT` | `mcve.c` | BUG | BUG: buffer replaced. The stale contents still read `"C"` and the restore "worked", so only the address check catches it here |
+| MSVC `/MTd` | `mcve.c` | BUG | BUG: stale contents `0xDD` fill, restore returned `NULL` |
+| MSVC `/Zi /fsanitize=address` | `mcve.c` | heap-use-after-free | heap-use-after-free (below) |
+| Linux glibc | either | not affected | not run in CI. libgfortran takes the `uselocale` path, and `"C"` is a static string |
+
+AddressSanitizer output (MSVC, same run):
+
+```
+ERROR: AddressSanitizer: heap-use-after-free on address 0x12153e9a0194
+SUMMARY: AddressSanitizer: heap-use-after-free D:\a\libgfortran-ucrt-setlocale\libgfortran-ucrt-setlocale\mcve.c:29 in main
+```
+
+Locally (Windows 10, user locale `English_United States.1252`), the UCRT restore
+instead lands on the user locale. The Fortran MCVE then reports
+`LC_NUMERIC after one I/O: English_United States.1252` at 6.8 µs/stmt, vs
+2.5 µs/stmt with msvcrt.
 
 ## Suggested fix
 
