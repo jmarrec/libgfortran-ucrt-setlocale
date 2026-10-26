@@ -1,0 +1,79 @@
+name: mcve
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# A failing job means the bug reproduced. The UCRT and MSVC debug/ASan jobs are
+# expected to fail until libgfortran stops reusing the setlocale(..., NULL) pointer.
+
+jobs:
+  mingw:
+    name: mingw-w64 gcc ${{ matrix.gcc }} posix-seh-${{ matrix.crt }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        gcc: ['16.2.0']
+        rt: ['rt_v14-rev1']
+        crt: [ucrt, msvcrt]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download toolchain
+        shell: pwsh
+        run: |
+          $name = "x86_64-${{ matrix.gcc }}-release-posix-seh-${{ matrix.crt }}-${{ matrix.rt }}"
+          $url = "https://github.com/niXman/mingw-builds-binaries/releases/download/${{ matrix.gcc }}-${{ matrix.rt }}/$name.7z"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\toolchain.7z"
+          7z x -y "-o$env:RUNNER_TEMP\toolchain" "$env:RUNNER_TEMP\toolchain.7z" | Out-Null
+          "$env:RUNNER_TEMP\toolchain\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Toolchain info
+        shell: pwsh
+        run: |
+          gfortran --version | Select-Object -First 1
+          (gfortran -v 2>&1 | Select-String 'with-sysroot') -replace '.*--with-sysroot=(\S+).*', 'sysroot: $1'
+
+      - name: Fortran MCVE
+        shell: pwsh
+        run: |
+          gfortran -O2 -static mcve.f90 -o mcve_f.exe
+          ./mcve_f.exe
+          exit $LASTEXITCODE
+
+      - name: C MCVE
+        if: always()
+        shell: pwsh
+        run: |
+          gcc -O2 -static mcve.c -o mcve_c.exe
+          ./mcve_c.exe
+          exit $LASTEXITCODE
+
+  msvc:
+    name: msvc ${{ matrix.name }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # release CRT: symptom depends on heap reuse, so it may or may not show
+          - name: release (/MT)
+            flags: /O2 /MT
+          # debug CRT fills freed memory with 0xDD: deterministic
+          - name: debug CRT (/MTd)
+            flags: /MTd
+          # reports heap-use-after-free in setlocale
+          - name: asan
+            flags: /Zi /fsanitize=address
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: C MCVE
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
+          cl /nologo ${{ matrix.flags }} mcve.c /Femcve_c.exe || exit /b 1
+          mcve_c.exe
