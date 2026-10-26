@@ -20,14 +20,17 @@ to keep the string alive, which is why this went unnoticed.
 
 ## Consequences with MinGW-w64 UCRT builds of gfortran
 
-- After the first formatted I/O statement, the restore through the dangling
-  pointer typically lands on the user's locale (here `English_United States.1252`)
-  instead of `"C"`. The process `LC_NUMERIC` stays wrong for any C code in the
-  same process.
-- From then on every I/O statement performs two real locale switches
-  (user → C → user). Measured cost: about 2.5 µs/statement with msvcrt vs
-  6.8 µs/statement with UCRT (GCC 16.2.0). An I/O-heavy program
-  (EnergyPlus `ReadVarsESO`) runs about 3x slower.
+- Every formatted I/O statement restores `LC_NUMERIC` through a freed string.
+  What happens next depends on what the freed memory holds:
+  - The garbage may resolve to the user's locale (here `English_United States.1252`).
+    The process `LC_NUMERIC` then stays wrong for any C code in the same process,
+    and every later statement performs two real locale switches (user → C → user).
+  - Or the restore fails (`NULL`) and the locale stays `"C"`. This was seen on
+    GitHub's `windows-latest` runners.
+- Either way UCRT's `setlocale` is much more expensive than msvcrt's. Measured
+  per internal write with GCC 16.2.0: 2.5 µs (msvcrt) vs 6.8 µs (UCRT, user-locale
+  case) locally, and 1.0 µs vs 2.5 µs (UCRT, failed-restore case) on GitHub runners.
+  An I/O-heavy program (EnergyPlus `ReadVarsESO`) runs about 3x slower.
 - With the debug CRT the restore fails instead (`NULL`). With ASan it is
   reported as `heap-use-after-free`, freed in `ucrt\src\appcrt\locale\setlocale.cpp`.
 
@@ -35,7 +38,7 @@ to keep the string alive, which is why this went unnoticed.
 
 | File | What it shows | Exit code |
 |---|---|---|
-| `mcve.f90` | One `write(buf,'(I0)')` changes the process `LC_NUMERIC`; times internal writes | 1 = bug |
+| `mcve.f90` | One `write(buf,'(I0)')` replaces the `LC_NUMERIC` name buffer libgfortran saved (and may change the process `LC_NUMERIC`); times internal writes | 1 = bug |
 | `mcve.c` | The exact save/switch/restore sequence, without Fortran | 1 = bug |
 | `.github/workflows/mcve.yml` | Runs both against niXman mingw-builds GCC 16.2.0 (`posix-seh-ucrt`, `posix-seh-msvcrt`) and the C MCVE against MSVC | failing job = bug reproduced |
 
@@ -56,9 +59,18 @@ cl /nologo /MTd mcve.c && mcve.exe                     :: deterministic: freed m
 cl /nologo /Zi /fsanitize=address mcve.c && mcve.exe   :: heap-use-after-free report
 ```
 
-With a release CRT (`/MT`, or MinGW-w64 UCRT) the symptom depends on whether
-the freed block has been reused, so `mcve.c` can occasionally print `OK`. The
-`/MTd` and ASan builds are deterministic.
+Both MCVEs detect the bug without depending on the contents of freed memory.
+They check that the name buffer returned by `setlocale(LC_NUMERIC, NULL)` was
+replaced. UCRT apparently allocates the new buffer before freeing the old
+one, so the address changes, while msvcrt keeps a static buffer. In 20 repeated runs
+each, detection was 20/20 with MinGW-w64 UCRT and with MSVC `/MT`, and 0/20
+false positives with msvcrt. What the stale pointer reads and what the restore
+does still vary with heap state. `/MTd` (freed memory is `0xDD`) and ASan show
+that part deterministically.
+
+Do not add a `setlocale(LC_NUMERIC, NULL)` call between saving the pointer and
+the restore. UCRT may then allocate at the just-freed address, which hides
+both symptoms.
 
 On Compiler Explorer, use `x64 msvc v19.latest` with `/MTd`. ASan does not run
 there, because the ASan runtime DLL is missing (`0xC0000135`).
@@ -67,9 +79,9 @@ there, because the ASan runtime DLL is missing (`0xC0000135`).
 
 | Toolchain | `mcve.f90` | `mcve.c` |
 |---|---|---|
-| MinGW-w64 GCC 16.2.0 posix-seh-**ucrt** | BUG (`LC_NUMERIC` → user locale) | BUG |
+| MinGW-w64 GCC 16.2.0 posix-seh-**ucrt** | BUG (buffer replaced; `LC_NUMERIC` → user locale or stays `"C"`) | BUG |
 | MinGW-w64 GCC 16.2.0 posix-seh-**msvcrt** | OK | OK |
-| MSVC `/MT` | — | BUG (heap dependent) |
+| MSVC `/MT` | — | BUG |
 | MSVC `/MTd` | — | BUG (restore returns `NULL`) |
 | MSVC `/fsanitize=address` | — | heap-use-after-free |
 | Linux glibc | not affected (`uselocale` path) | OK (`"C"` is a static string) |

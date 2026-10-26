@@ -58,7 +58,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # release CRT: symptom depends on heap reuse, so it may or may not show
+          # release CRT: detected through the replaced name buffer
           - name: release (/MT)
             flags: /O2 /MT
           # debug CRT fills freed memory with 0xDD: deterministic

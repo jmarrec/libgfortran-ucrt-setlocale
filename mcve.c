@@ -7,8 +7,9 @@
 // happen to keep it alive.
 //
 // Exit code: 0 = pointer still valid and restore worked, 1 = bug observed.
-// With a release CRT the symptom depends on heap reuse; build with MSVC /MTd
-// (freed memory filled with 0xDD) or /fsanitize=address for a deterministic result.
+// The "pointer replaced" check is deterministic. What the stale pointer reads,
+// and what the restore does, depends on heap reuse with a release CRT; build with
+// MSVC /MTd (freed memory filled with 0xDD) or /fsanitize=address to see it every time.
 #define _CRT_SECURE_NO_WARNINGS
 #include <locale.h>
 #include <stdio.h>
@@ -21,15 +22,19 @@ int main(void) {
   saved_copy[sizeof saved_copy - 1] = '\0';
   printf("saved:    %p \"%s\"\n", (void *)old_locale, saved_copy);
 
-  setlocale(LC_NUMERIC, "C");
+  // the returned pointer is the new name buffer; comparing addresses does not
+  // read the possibly freed string
+  char *current = setlocale(LC_NUMERIC, "C");
+  int replaced = current != old_locale;
   int changed = strcmp(old_locale, saved_copy) != 0;
+  printf("set C:    %p   <- name buffer %s\n", (void *)current, replaced ? "REPLACED, saved pointer is stale" : "unchanged");
   printf("after C:  %p \"%s\"   <- same pointer, contents %s\n", (void *)old_locale, old_locale,
          changed ? "CHANGED" : "unchanged");
 
   char *restored = setlocale(LC_NUMERIC, old_locale);
   printf("restored: \"%s\"   (expected \"%s\")\n", restored ? restored : "(null: restore failed)", saved_copy);
 
-  int bug = changed || restored == NULL || strcmp(restored, saved_copy) != 0;
+  int bug = replaced || changed || restored == NULL || strcmp(restored, saved_copy) != 0;
   printf("%s\n", bug ? "BUG: saved locale pointer was invalidated" : "OK");
   return bug;
 }

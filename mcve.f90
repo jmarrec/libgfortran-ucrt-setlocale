@@ -4,8 +4,14 @@
 ! LC_NUMERIC is no longer "C", and every later I/O statement pays for two real
 ! locale switches.
 !
+! Whether the restore lands on another locale (here the user locale) or fails
+! (locale stays "C") depends on what the freed memory holds. The buffer address
+! check is deterministic: if setlocale(LC_NUMERIC, NULL) returns a different
+! buffer after one I/O statement, the one libgfortran saved and restored through
+! was replaced (and with UCRT, freed).
+!
 ! gfortran -O2 -static mcve.f90 -o mcve.exe && mcve.exe
-! Exit code: 0 = LC_NUMERIC unchanged, 1 = bug observed.
+! Exit code: 0 = OK, 1 = bug observed.
 program mcve
   use iso_c_binding
   implicit none
@@ -28,13 +34,19 @@ program mcve
   character(len=:), allocatable :: before, after
   integer :: i
   integer(8) :: c0, c1, rate
+  integer(c_intptr_t) :: buf_before, buf_after
+  logical :: replaced
 
   ! query outside of any I/O statement: during a transfer libgfortran forces "C"
   before = numeric_locale()
+  buf_before = transfer(setlocale(LC_NUMERIC, c_null_ptr), buf_before)
   write(buf, '(I0)') 1
+  buf_after = transfer(setlocale(LC_NUMERIC, c_null_ptr), buf_after)
   after = numeric_locale()
+  replaced = buf_after /= buf_before
   print '(A,A)', 'LC_NUMERIC before any I/O: ', before
   print '(A,A)', 'LC_NUMERIC after one I/O:  ', after
+  print '(A,Z0,A,Z0)', 'name buffer: ', buf_before, ' -> ', buf_after
 
   call system_clock(c0, rate)
   do i = 1, n
@@ -45,6 +57,10 @@ program mcve
 
   if (after /= before) then
     print '(A)', 'BUG: one formatted I/O statement changed the process LC_NUMERIC'
+    stop 1
+  end if
+  if (replaced) then
+    print '(A)', 'BUG: libgfortran restored LC_NUMERIC through a stale pointer'
     stop 1
   end if
   print '(A)', 'OK'
